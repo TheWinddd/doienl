@@ -1,6 +1,10 @@
 """
 EndNote ENLX → ENL Converter
-Giải nén file .enlx (thực chất là ZIP) để lấy ra .enl + thư mục .Data
+Hỗ trợ 2 cấu trúc ENLX:
+  - Chuẩn mới: chứa TenFile.enl trực tiếp
+  - Chuẩn cũ:  chứa sdb/pdb.eni + sdb/sdb.eni + PDF/
+    → pdb.eni được đổi tên thành TenFile.enl
+    → PDF/ được đổi tên thành TenFile.Data/
 """
 
 import streamlit as st
@@ -154,12 +158,12 @@ st.markdown("""
 # ── Giải thích kỹ thuật ────────────────────────────────────────────────────────
 st.markdown("""
 <div class="info-box">
-    <strong>🔍 Tại sao không chỉ đổi tên?</strong><br>
-    File <code>.enlx</code> thực chất là một <strong>file ZIP</strong> bên trong chứa:<br>
-    &nbsp;&nbsp;• <code>TenThuVien.enl</code> — thư viện tài liệu tham khảo<br>
-    &nbsp;&nbsp;• <code>TenThuVien.Data/</code> — thư mục PDF, hình ảnh đính kèm<br><br>
-    Công cụ này sẽ <strong>giải nén đúng cách</strong> và đóng gói lại thành file <code>.zip</code>
-    để bạn tải về, đảm bảo EndNote mở được bình thường.
+    <strong>🔍 Công cụ hỗ trợ 2 kiểu cấu trúc ENLX:</strong><br><br>
+    <strong>Cấu trúc mới</strong> (EndNote X7+): chứa sẵn <code>ThuVien.enl</code> + <code>ThuVien.Data/</code><br>
+    <strong>Cấu trúc cũ</strong> (EndNote ≤X4): chứa <code>sdb/pdb.eni</code> + <code>PDF/</code><br>
+    &nbsp;&nbsp;→ Tool sẽ tự đổi tên <code>pdb.eni</code> thành <code>ThuVien.enl</code><br>
+    &nbsp;&nbsp;→ Tool sẽ tự đổi tên <code>PDF/</code> thành <code>ThuVien.Data/</code><br><br>
+    Kết quả: file <code>.zip</code> → giải nén → double-click <code>.enl</code> là mở được EndNote ngay.
 </div>
 """, unsafe_allow_html=True)
 
@@ -170,11 +174,80 @@ uploaded = st.file_uploader(
     help="Chỉ hỗ trợ định dạng .enlx của EndNote X7 trở lên",
 )
 
+def detect_structure(all_names):
+    """
+    Phát hiện cấu trúc bên trong ENLX:
+      - 'new': có file .enl trực tiếp
+      - 'old': có sdb/pdb.eni (cấu trúc cũ)
+      - 'unknown': không nhận dạng được
+    """
+    enl_files = [n for n in all_names if n.lower().endswith(".enl") and "/" not in n]
+    if enl_files:
+        return "new", enl_files[0]
+
+    pdb_files = [n for n in all_names if n.lower().endswith("pdb.eni")]
+    if pdb_files:
+        return "old", pdb_files[0]
+
+    return "unknown", None
+
+
+def build_output_zip(zf, all_names, structure, detail, base_name):
+    """
+    Tạo ZIP output với cấu trúc chuẩn:
+      base_name.enl
+      base_name.Data/  (nếu có PDF)
+    """
+    output_buf = io.BytesIO()
+    with zipfile.ZipFile(output_buf, "w", zipfile.ZIP_DEFLATED) as out_zip:
+
+        if structure == "new":
+            # Copy nguyên, chỉ đảm bảo tên enl đúng
+            for item in all_names:
+                data = zf.read(item)
+                if item == detail:
+                    out_zip.writestr(f"{base_name}.enl", data)
+                elif item.lower().startswith(Path(detail).stem.lower() + ".data/") or \
+                     item.lower().startswith("pdf/"):
+                    # Đổi thư mục .Data nếu cần
+                    new_path = f"{base_name}.Data/" + item.split("/", 1)[-1]
+                    if not item.endswith("/"):
+                        out_zip.writestr(new_path, data)
+                else:
+                    if not item.endswith("/"):
+                        out_zip.writestr(item, data)
+
+        elif structure == "old":
+            # pdb.eni → base_name.enl
+            # PDF/    → base_name.Data/
+            for item in all_names:
+                if item.endswith("/"):
+                    continue  # bỏ qua directory entry
+                data = zf.read(item)
+
+                if item.lower() == detail.lower():
+                    # File database chính → đổi thành .enl
+                    out_zip.writestr(f"{base_name}.enl", data)
+                elif item.lower().startswith("pdf/"):
+                    # Thư mục PDF → đổi thành base_name.Data/
+                    sub = item[len("pdf/"):]
+                    if sub:
+                        out_zip.writestr(f"{base_name}.Data/{sub}", data)
+                elif item.lower().startswith("sdb/"):
+                    # Các file sdb khác (sdb.eni...) → bỏ qua, không cần thiết
+                    pass
+                else:
+                    out_zip.writestr(item, data)
+
+    return output_buf.getvalue()
+
+
 if uploaded is not None:
     st.markdown("---")
 
-    # Kiểm tra xem có phải ZIP hợp lệ không
     raw_bytes = uploaded.read()
+    # Lấy tên file gốc làm base_name mặc định
+    original_stem = Path(uploaded.name).stem
 
     col1, col2, col3 = st.columns(3)
     col1.metric("Kích thước gốc", f"{len(raw_bytes) / 1024:.1f} KB")
@@ -184,70 +257,66 @@ if uploaded is not None:
         <div class="result-err">
             <h4>❌ File không hợp lệ</h4>
             File này không phải định dạng ENLX chuẩn (không phải ZIP).<br>
-            Hãy kiểm tra lại — có thể file đã bị hỏng hoặc chỉ là file ENL đổi tên.
+            Hãy kiểm tra lại — có thể file đã bị hỏng.
         </div>
         """, unsafe_allow_html=True)
     else:
         try:
             with zipfile.ZipFile(io.BytesIO(raw_bytes)) as zf:
                 all_names = zf.namelist()
-
-                # Tìm file .enl bên trong
-                enl_files = [n for n in all_names if n.lower().endswith(".enl") and not n.startswith("__")]
+                structure, detail = detect_structure(all_names)
 
                 col2.metric("Files bên trong", len(all_names))
 
-                if not enl_files:
+                # ── Hiển thị cấu trúc file ──────────────────────────────
+                with st.expander("📂 Xem cấu trúc file gốc"):
+                    for name in sorted(all_names):
+                        is_key = detail and (name == detail or name.lower().endswith(".enl"))
+                        color = "highlight" if is_key else ""
+                        st.markdown(
+                            f'<div class="file-item"><span class="{color}">{name}</span></div>',
+                            unsafe_allow_html=True
+                        )
+
+                if structure == "unknown":
                     st.markdown("""
                     <div class="result-err">
-                        <h4>⚠️ Không tìm thấy file .enl</h4>
-                        File ZIP này không chứa thư viện EndNote (.enl).<br>
-                        Cấu trúc bên trong có thể bị lỗi.
+                        <h4>⚠️ Không nhận dạng được cấu trúc</h4>
+                        File không chứa <code>.enl</code> hay <code>sdb/pdb.eni</code>.<br>
+                        Đây có thể không phải file EndNote hợp lệ.
                     </div>
                     """, unsafe_allow_html=True)
-                    with st.expander("Xem cấu trúc file"):
-                        for name in all_names[:50]:
-                            st.code(name)
                 else:
-                    enl_name = enl_files[0]
-                    base_name = Path(enl_name).stem  # tên không có đuôi
+                    label_map = {"new": "Chuẩn mới (có .enl)", "old": "Chuẩn cũ (sdb/pdb.eni)"}
+                    col3.metric("Loại cấu trúc", label_map[structure])
 
-                    col3.metric("Thư viện ENL", base_name)
-
-                    # Hiển thị nội dung
                     st.markdown(f"""
                     <div class="result-ok">
-                        <h4>✅ Phân tích thành công</h4>
-                        Tìm thấy thư viện: <code style="color:#3fb950">{enl_name}</code>
+                        <h4>✅ Nhận dạng thành công — {label_map[structure]}</h4>
+                        File chính: <code style="color:#3fb950">{detail}</code><br>
+                        Sẽ xuất ra: <code style="color:#3fb950">{original_stem}.enl</code>
+                        {"+ <code style='color:#3fb950'>" + original_stem + ".Data/</code>" if any("pdf/" in n.lower() or ".data/" in n.lower() for n in all_names) else ""}
                     </div>
                     """, unsafe_allow_html=True)
-
-                    with st.expander("📂 Xem tất cả files bên trong"):
-                        for name in sorted(all_names):
-                            is_enl = name.lower().endswith(".enl")
-                            color = "highlight" if is_enl else ""
-                            st.markdown(
-                                f'<div class="file-item"><span class="{color}">{name}</span></div>',
-                                unsafe_allow_html=True
-                            )
 
                     st.markdown("---")
 
-                    # ── Tạo file ZIP output ─────────────────────────────────
-                    output_buf = io.BytesIO()
-                    with zipfile.ZipFile(output_buf, "w", zipfile.ZIP_DEFLATED) as out_zip:
-                        for item in all_names:
-                            data = zf.read(item)
-                            out_zip.writestr(item, data)
-                    output_zip_bytes = output_buf.getvalue()
+                    # ── Nhập tên file output ────────────────────────────
+                    custom_name = st.text_input(
+                        "Tên thư viện EndNote (không cần đuôi .enl)",
+                        value=original_stem,
+                        placeholder="VD: NghienCuu_2024",
+                        help="Tên này sẽ được dùng cho file .enl và thư mục .Data"
+                    )
+                    base_name = custom_name.strip() if custom_name.strip() else original_stem
 
-                    # Tên file tải về
-                    output_filename = f"{base_name}_converted.zip"
+                    # ── Build ZIP ───────────────────────────────────────
+                    output_zip_bytes = build_output_zip(zf, all_names, structure, detail, base_name)
+                    output_filename = f"{base_name}.zip"
 
                     st.info(
-                        f"💡 Sau khi tải về: **giải nén** file `{output_filename}` "
-                        f"→ bạn sẽ thấy `{base_name}.enl` và thư mục `{base_name}.Data/` "
-                        f"(nếu có). Mở `{base_name}.enl` bằng EndNote là xong.",
+                        f"💡 Sau khi tải về: **giải nén** `{output_filename}` "
+                        f"→ double-click `{base_name}.enl` là EndNote mở ngay.",
                         icon="📋"
                     )
 
